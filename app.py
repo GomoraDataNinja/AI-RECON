@@ -227,30 +227,17 @@ def token_overlap(a: str, b: str, min_len: int = 4) -> float:
 # More DocID patterns (flexible)
 # =========================
 DOCID_PATTERNS = [
-    # Your current pattern
     re.compile(r"\b(HREINV|HRECRN)\s*0*([0-9]+)\b", re.IGNORECASE),
-
-    # Common invoice / credit / debit formats
     re.compile(r"\b(INV|INVOICE)\s*[-_ ]*\s*0*([0-9]{4,})\b", re.IGNORECASE),
     re.compile(r"\b(CRN|CREDITNOTE|CREDIT)\s*[-_ ]*\s*0*([0-9]{4,})\b", re.IGNORECASE),
     re.compile(r"\b(DN|DEBITNOTE|DEBIT)\s*[-_ ]*\s*0*([0-9]{4,})\b", re.IGNORECASE),
-
-    # “Doc 12345”, “Document No 12345”
     re.compile(r"\b(DOC|DOCUMENT)\s*(NO|NUMBER|#)?\s*[:\- ]*\s*0*([0-9]{4,})\b", re.IGNORECASE),
-
-    # AE style (you had this idea)
     re.compile(r"\bAE[A-Z]{0,3}\d{4,}\b", re.IGNORECASE),
-
-    # Long digit IDs (only if “inv/doc/ref” nearby)
     re.compile(r"\b(?:INV|DOC|REF|REFERENCE)\D{0,6}(0*[0-9]{6,})\b", re.IGNORECASE),
 ]
 
 
 def extract_docid(text: str) -> str:
-    """
-    Returns a single normalized DocID candidate (best effort).
-    We pick the last match in the text to mimic real-world “most relevant at end”.
-    """
     t = upper(text)
     best = ""
     best_pos = -1
@@ -261,7 +248,6 @@ def extract_docid(text: str) -> str:
             if rx.pattern.startswith("\\bAE"):
                 cand = norm_ref(m.group(0))
             else:
-                # patterns may have 2 or 3 groups
                 g = [x for x in m.groups() if x is not None]
                 if len(g) >= 2:
                     prefix = norm_ref(g[0])
@@ -408,7 +394,6 @@ def infer_col_by_type(df: pd.DataFrame, role: str) -> str:
 
         score = 0.0
         if role == "date":
-            # date-like columns often contain / or - and parseable text
             sample = s.head(25).tolist()
             ok = 0
             for v in sample:
@@ -454,18 +439,15 @@ def map_columns(df: pd.DataFrame) -> Dict[str, str]:
 
     for target, syns in SYNONYMS.items():
         found = ""
-        # exact synonym
         for c, cn in col_norm.items():
             if cn in syns:
                 found = c
                 break
-        # contains synonym
         if not found:
             for c, cn in col_norm.items():
                 if any(s in cn for s in syns):
                     found = c
                     break
-        # type inference fallback
         if not found:
             if target in ("txn_date",):
                 found = infer_col_by_type(df, "date")
@@ -529,7 +511,6 @@ def normalize_table(df_raw: pd.DataFrame, meta: Dict[str, Any], colmap: Dict[str
     out["amt_r0"] = out["amount_signed"].apply(round0)
     out["abs_amount"] = out["amount_signed"].abs()
 
-    # DocID extraction uses all text (this is what fixes “docIDs change”)
     blob = (
         out["invoice_no_raw"].astype(str)
         + " "
@@ -543,8 +524,6 @@ def normalize_table(df_raw: pd.DataFrame, meta: Dict[str, Any], colmap: Dict[str
     )
     out["blob_text"] = blob.apply(norm_space)
     out["docid"] = out["blob_text"].apply(extract_docid)
-
-    # For faster token matching
     out["token_blob"] = out["blob_text"].apply(lambda s: " ".join(extract_tokens(s, min_len=cfg.min_token_len)))
 
     out["source_type"] = source_type
@@ -565,11 +544,8 @@ def normalize_table(df_raw: pd.DataFrame, meta: Dict[str, Any], colmap: Dict[str
         axis=1,
     )
 
-    # keep meaningful rows
     keep = out["amount_signed"].notna() | out["invoice_key"].ne("") | out["doc_key"].ne("") | out["docid"].ne("")
     out = out.loc[keep].copy()
-
-    # drop rows with no date AND no identifiers (junk)
     out = out.loc[~(out["txn_date"].isna() & out["invoice_key"].eq("") & out["doc_key"].eq("") & out["docid"].eq(""))].copy()
 
     return out.reset_index(drop=True)
@@ -694,9 +670,7 @@ def reconcile_fast(statement_all: pd.DataFrame, ledger_all: pd.DataFrame, cfg: R
 
     used_ledger = set()
 
-    # ---------
     # 1) DOCID TOTALS (group to group)
-    # ---------
     st_doc = st_df.loc[st_df["docid"].fillna("").astype(str).ne("")].copy()
     lg_doc = lg_df.loc[lg_df["docid"].fillna("").astype(str).ne("")].copy()
 
@@ -734,7 +708,6 @@ def reconcile_fast(statement_all: pd.DataFrame, ledger_all: pd.DataFrame, cfg: R
             status = "Matched" if (float(r["abs_diff"]) <= cfg.amount_tolerance and sc >= cfg.min_auto_confidence) else "Needs review"
 
             gid = new_gid("D")
-            # mark all rows from both sides as matched to this gid
             s_uids = [x for x in to_str(r.get("statement_uids", "")).split(",") if x.strip()]
             l_uids = [x for x in to_str(r.get("ledger_uids", "")).split(",") if x.strip()]
 
@@ -765,9 +738,7 @@ def reconcile_fast(statement_all: pd.DataFrame, ledger_all: pd.DataFrame, cfg: R
                 }
             )
 
-    # ---------
-    # 2) INVOICE TOTALS (key to key) for remaining unmatched
-    # ---------
+    # 2) INVOICE TOTALS for remaining
     st_rem = st_df.loc[~st_df["match_status"].eq("matched")].copy()
     lg_rem = lg_df.loc[~lg_df["match_status"].eq("matched")].copy()
 
@@ -802,12 +773,9 @@ def reconcile_fast(statement_all: pd.DataFrame, ledger_all: pd.DataFrame, cfg: R
             merged["abs_diff"] = merged["diff"].abs()
             merged["date_diff"] = merged.apply(lambda x: date_diff_days(x["statement_date"], x["ledger_date"]), axis=1)
             merged["overlap"] = merged.apply(lambda x: token_overlap(to_str(x["statement_details"]), to_str(x["ledger_details"]), min_len=cfg.min_token_len), axis=1)
-
-            # best first
             merged = merged.sort_values(["abs_diff", "date_diff"], ascending=[True, True])
 
             for _, r in merged.iterrows():
-                # skip if these uids already matched by previous loop
                 s_uids = [x for x in to_str(r.get("statement_uids", "")).split(",") if x.strip()]
                 l_uids = [x for x in to_str(r.get("ledger_uids", "")).split(",") if x.strip()]
                 if any(st_df.loc[st_df["row_uid"].astype(str).isin(s_uids), "match_status"].eq("matched")):
@@ -846,9 +814,7 @@ def reconcile_fast(statement_all: pd.DataFrame, ledger_all: pd.DataFrame, cfg: R
                     }
                 )
 
-    # ---------
-    # 3) AMOUNT + DATE WINDOW fallback (rounded buckets)
-    # ---------
+    # 3) AMOUNT + DATE WINDOW fallback
     st_rem = st_df.loc[~st_df["match_status"].eq("matched")].copy()
     lg_rem = lg_df.loc[~lg_df["match_status"].eq("matched")].copy()
     if not st_rem.empty and not lg_rem.empty:
@@ -869,7 +835,6 @@ def reconcile_fast(statement_all: pd.DataFrame, ledger_all: pd.DataFrame, cfg: R
             if cand is None or cand.empty:
                 continue
 
-            # date filter first
             if pd.notna(s_dt):
                 cand2 = cand.loc[cand["txn_date"].apply(lambda d: within_window(d, s_dt, cfg.date_window_days))].copy()
             else:
@@ -878,7 +843,6 @@ def reconcile_fast(statement_all: pd.DataFrame, ledger_all: pd.DataFrame, cfg: R
             if cand2.empty:
                 continue
 
-            # amount tolerance on r2
             s_amt = float(sr.get("amount_signed"))
             cand2["abs_diff"] = (cand2["amount_signed"].astype(float) - s_amt).abs()
             cand2 = cand2.sort_values(["abs_diff"]).head(6)
@@ -893,7 +857,6 @@ def reconcile_fast(statement_all: pd.DataFrame, ledger_all: pd.DataFrame, cfg: R
             if l_uid in used_ledger:
                 continue
 
-            # token boost
             overlap = token_overlap(to_str(sr.get("blob_text", "")), to_str(best.get("blob_text", "")), min_len=cfg.min_token_len)
             sc = 0.72 + (0.08 if overlap >= 0.20 else 0.0)
             rs = "Matched by amount + date window" + (" + tokens" if overlap >= 0.20 else "")
@@ -932,7 +895,6 @@ def reconcile_fast(statement_all: pd.DataFrame, ledger_all: pd.DataFrame, cfg: R
     matched_ledger = lg_df.loc[lg_df["match_status"].eq("matched")].copy()
     unmatched_ledger = lg_df.loc[~lg_df["match_status"].eq("matched")].copy()
 
-    # Recon tables for template
     left_table = pd.DataFrame({
         "Date": unmatched_ledger["txn_date"],
         "Ref": unmatched_ledger["docid"].replace("", np.nan).combine_first(unmatched_ledger["invoice_no_raw"].replace("", np.nan)).combine_first(unmatched_ledger["doc_no_raw"].replace("", np.nan)),
@@ -1012,11 +974,8 @@ def export_recon_template_bytes(
     commentary_lines: List[Tuple[str, str]],
 ):
     wb = load_workbook(io.BytesIO(template_bytes))
-
-    # prefer a "Recon" sheet, else use first sheet
     ws = wb["Recon"] if "Recon" in wb.sheetnames else wb[wb.sheetnames[0]]
 
-    # header cells (based on your sample template)
     try:
         ws["F2"].value = supplier_name
     except Exception:
@@ -1038,7 +997,6 @@ def export_recon_template_bytes(
         ws.insert_rows(totals_row, amount=insert_n)
         totals_row += insert_n
 
-    # Copy style from row start_row into inserted area
     template_style_row = start_row
     for r in range(start_row + available_rows, start_row + needed_rows):
         for c in range(2, 13):
@@ -1047,7 +1005,6 @@ def export_recon_template_bytes(
             dst._style = pycopy(src._style)
             dst.number_format = src.number_format
 
-    # Clear area
     for r in range(start_row, start_row + needed_rows):
         for c in range(2, 13):
             ws.cell(r, c).value = None
@@ -1079,13 +1036,11 @@ def export_recon_template_bytes(
             ws.cell(r, RIGHT["Amount"]).value = excel_safe(it.get("Amount"))
             ws.cell(r, RIGHT["Action"]).value = excel_safe(it.get("Action", ""))
 
-    # Totals formulas
     left_sum_range = f"E{start_row}:E{start_row + needed_rows - 1}"
     right_sum_range = f"K{start_row}:K{start_row + needed_rows - 1}"
     ws[f"E{totals_row}"].value = f"=SUM({left_sum_range})"
     ws[f"K{totals_row}"].value = f"=SUM({right_sum_range})"
 
-    # Put a small commentary section in the workbook as its own sheet
     if "Commentary" in wb.sheetnames:
         wb.remove(wb["Commentary"])
     ws_c = wb.create_sheet("Commentary")
@@ -1101,7 +1056,6 @@ def export_recon_template_bytes(
     ws_c.column_dimensions["A"].width = 34
     ws_c.column_dimensions["B"].width = 80
 
-    # Replace / create detail sheets
     def write_df_sheet(name: str, df: pd.DataFrame):
         if name in wb.sheetnames:
             wb.remove(wb[name])
@@ -1177,52 +1131,125 @@ def build_run_context(rr: Dict[str, Any]) -> str:
 # =========================
 # UI
 # =========================
-st.set_page_config(page_title="Tarisai", layout="wide")
+st.set_page_config(
+    page_title="Tarisai",
+    layout="wide",
+    initial_sidebar_state="collapsed",
+)
 
+# DEPLOYMENT LOCK CSS
 st.markdown(
     f"""
 <style>
-html, body, [class*="css"] {{
-    background-color: {WF_BG} !important;
-    color: {WF_TEXT} !important;
+:root {{
+  --wf-red: {WF_RED};
+  --wf-bg: {WF_BG};
+  --wf-card: {WF_CARD};
+  --wf-text: {WF_TEXT};
+  --wf-muted: {WF_MUTED};
+  --wf-border: {WF_BORDER};
 }}
+
+html, body {{
+  background-color: var(--wf-bg) !important;
+  color: var(--wf-text) !important;
+}}
+
+.stApp {{
+  background-color: var(--wf-bg) !important;
+  color: var(--wf-text) !important;
+}}
+
 .block-container {{
-    padding-top: 2.4rem;
-    padding-bottom: 2rem;
-    max-width: 1250px;
+  padding-top: 2.4rem !important;
+  padding-bottom: 2rem !important;
+  max-width: 1250px !important;
 }}
+
+h1, h2, h3, h4, h5, h6,
+p, span, label, div {{
+  color: var(--wf-text);
+}}
+
+[data-testid="stMarkdownContainer"] p,
+[data-testid="stMarkdownContainer"] span,
+[data-testid="stMarkdownContainer"] div {{
+  color: var(--wf-text) !important;
+}}
+
+[data-testid="stWidgetLabel"] > div {{
+  color: var(--wf-text) !important;
+  font-weight: 700 !important;
+}}
+
+[data-testid="stCaptionContainer"] {{
+  color: var(--wf-muted) !important;
+}}
+
+[data-testid="stTextInput"] input,
+[data-testid="stNumberInput"] input {{
+  color: var(--wf-text) !important;
+  background: white !important;
+}}
+
+[data-testid="stFileUploader"] label {{
+  color: var(--wf-text) !important;
+}}
+
+[data-testid="stTabs"] button p {{
+  color: var(--wf-text) !important;
+  font-weight: 800 !important;
+}}
+
 .tarisai-hero {{
-    background: {WF_CARD};
-    border: 1px solid {WF_BORDER};
-    border-left: 6px solid {WF_RED};
-    border-radius: 16px;
-    padding: 18px 18px;
-    margin-bottom: 14px;
+  background: var(--wf-card) !important;
+  border: 1px solid var(--wf-border) !important;
+  border-left: 6px solid var(--wf-red) !important;
+  border-radius: 16px !important;
+  padding: 18px 18px !important;
+  margin-bottom: 14px !important;
 }}
+
 .tarisai-title {{
-    font-size: 22px;
-    font-weight: 800;
-    margin: 0;
+  font-size: 22px !important;
+  font-weight: 800 !important;
+  margin: 0 !important;
+  color: var(--wf-text) !important;
 }}
+
 .tarisai-sub {{
-    font-size: 14px;
-    color: {WF_MUTED};
-    margin-top: 6px;
-    margin-bottom: 0;
+  font-size: 14px !important;
+  color: var(--wf-muted) !important;
+  margin-top: 6px !important;
+  margin-bottom: 0 !important;
 }}
+
 .tarisai-card {{
-    background: {WF_CARD};
-    border: 1px solid {WF_BORDER};
-    border-radius: 16px;
-    padding: 14px 14px;
-    margin-bottom: 14px;
+  background: var(--wf-card) !important;
+  border: 1px solid var(--wf-border) !important;
+  border-radius: 16px !important;
+  padding: 14px 14px !important;
+  margin-bottom: 14px !important;
 }}
+
 div.stButton > button {{
-    background: {WF_RED} !important;
-    color: white !important;
-    border: 1px solid {WF_RED} !important;
-    border-radius: 12px !important;
-    font-weight: 800 !important;
+  background: var(--wf-red) !important;
+  color: white !important;
+  border: 1px solid var(--wf-red) !important;
+  border-radius: 12px !important;
+  font-weight: 800 !important;
+}}
+
+div.stButton > button:hover {{
+  opacity: 0.92 !important;
+}}
+
+header[data-testid="stHeader"] {{
+  background: transparent !important;
+}}
+
+#MainMenu, footer {{
+  visibility: hidden;
 }}
 </style>
 """,
@@ -1255,9 +1282,7 @@ if "last_cfg" not in st.session_state:
 
 tabs = st.tabs(["Run", "Review", "Chat", "Download"])
 
-# =========================
 # RUN TAB
-# =========================
 with tabs[0]:
     st.markdown('<div class="tarisai-card">', unsafe_allow_html=True)
     c1, c2 = st.columns([1, 1])
@@ -1279,10 +1304,10 @@ with tabs[0]:
     a, b = st.columns(2)
     with a:
         st.subheader("Supplier workbook")
-        supplier_file = st.file_uploader("Upload supplier Excel", type=["xlsx", "xls"], key="supp_up")
+        supplier_file = st.file_uploader("Upload supplier Excel", type=["xlsx"], key="supp_up")
     with b:
         st.subheader("Ledger workbook")
-        ledger_file = st.file_uploader("Upload ledger Excel", type=["xlsx", "xls"], key="ledg_up")
+        ledger_file = st.file_uploader("Upload ledger Excel", type=["xlsx"], key="ledg_up")
     st.markdown("</div>", unsafe_allow_html=True)
 
     st.markdown('<div class="tarisai-card">', unsafe_allow_html=True)
@@ -1330,9 +1355,7 @@ with tabs[0]:
         elif rr and rr.get("error"):
             st.error(rr["error"])
 
-# =========================
 # REVIEW TAB
-# =========================
 with tabs[1]:
     st.markdown('<div class="tarisai-card">', unsafe_allow_html=True)
     st.subheader("Review")
@@ -1375,9 +1398,7 @@ with tabs[1]:
 
     st.markdown("</div>", unsafe_allow_html=True)
 
-# =========================
 # CHAT TAB (Ollama)
-# =========================
 with tabs[2]:
     st.markdown('<div class="tarisai-card">', unsafe_allow_html=True)
     st.subheader("Chat (Ollama local)")
@@ -1447,9 +1468,7 @@ with tabs[2]:
 
     st.markdown("</div>", unsafe_allow_html=True)
 
-# =========================
 # DOWNLOAD TAB
-# =========================
 with tabs[3]:
     st.markdown('<div class="tarisai-card">', unsafe_allow_html=True)
     st.subheader("Download")
@@ -1464,7 +1483,6 @@ with tabs[3]:
             st.warning("Upload your Recon template in the Run tab to get your exact output structure.")
             st.caption("You can still export the raw sheets, but your preferred layout needs the template.")
         else:
-            # Build short, practical commentary (goes into the output)
             cfg = st.session_state.last_cfg
             commentary = [
                 ("What matched", f"{len(rr['matched_statement'])} statement lines matched using DocID totals, invoice totals, and amount/date fallback."),
