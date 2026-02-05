@@ -1,6 +1,9 @@
+streamlit
+requests
 streamlit>=1.28
 openai>=1.0.0
 pandas
 numpy
 openpyxl
 python-dateutil
+
