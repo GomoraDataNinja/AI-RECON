@@ -334,26 +334,16 @@ def detect_best_table_in_sheet(raw: pd.DataFrame, max_scan_rows: int = 80, sheet
     return best_df, meta
 
 
-def load_best_table_from_workbook_bytes(xlsx_bytes: bytes):
-    xls = pd.ExcelFile(io.BytesIO(xlsx_bytes), engine="openpyxl")
-    best_df, best_meta = None, None
-    for sh in xls.sheet_names:
-        raw = pd.read_excel(io.BytesIO(xlsx_bytes), sheet_name=sh, header=None, dtype=object, engine="openpyxl")
-        df, meta = detect_best_table_in_sheet(raw, sheet_name=sh)
-        if df is None or meta is None:
-            continue
-        if best_df is None or meta["score"] > best_meta["score"]:
-            best_df, best_meta = df, meta
-    return best_df, best_meta, xls.sheet_names
-
-
 # =========================
 # Column mapping (practical)
 # =========================
 SYNONYMS = {
     "txn_date": ["DATE", "POSTING DATE", "DOC DATE", "DOCUMENT DATE", "INVOICE DATE", "TRANSACTION DATE"],
     "invoice_no": ["INVOICE", "VENDOR INVOICE", "INVOICE NO", "INVOICE NUMBER", "SUPPLIER INVOICE", "INV NO", "INV#"],
-    "doc_no": ["DOCUMENT", "DOCUMENT NO", "DOCUMENT NUMBER", "DOC NO", "DOC#", "VOUCHER", "VOUCHER NO", "EXTERNAL DOC", "EXTERNAL DOCUMENT", "EXTERNAL DOCUMENT NO", "EXTERNAL DOCUMENT NUMBER"],
+    "doc_no": [
+        "DOCUMENT", "DOCUMENT NO", "DOCUMENT NUMBER", "DOC NO", "DOC#", "VOUCHER", "VOUCHER NO",
+        "EXTERNAL DOC", "EXTERNAL DOCUMENT", "EXTERNAL DOCUMENT NO", "EXTERNAL DOCUMENT NUMBER"
+    ],
     "reference_text": ["REFERENCE", "REF", "REFERENCE NO", "OUR REF", "YOUR REF", "DOCUMENT NO", "DOC NO"],
     "description": ["DESCRIPTION", "DETAILS", "NARRATION", "TEXT", "PARTICULARS"],
     "debit": ["DEBIT", "DR", "DEBITS"],
@@ -362,21 +352,6 @@ SYNONYMS = {
     "balance": ["BALANCE", "RUNNING BALANCE"],
     "doc_type": ["TYPE", "DOCUMENT TYPE", "DOC TYPE"],
 }
-
-
-def first_matching_col(df: pd.DataFrame, keywords: List[str]) -> str:
-    if df is None or df.empty:
-        return ""
-    cols = list(df.columns)
-    cols_l = [to_str(c).lower() for c in cols]
-    for kw in keywords:
-        kw = to_str(kw).lower()
-        if not kw:
-            continue
-        for i, cl in enumerate(cols_l):
-            if kw in cl:
-                return cols[i]
-    return ""
 
 
 def infer_col_by_type(df: pd.DataFrame, role: str) -> str:
@@ -448,6 +423,7 @@ def map_columns(df: pd.DataFrame) -> Dict[str, str]:
                 if any(s in cn for s in syns):
                     found = c
                     break
+
         if not found:
             if target in ("txn_date",):
                 found = infer_col_by_type(df, "date")
@@ -469,7 +445,14 @@ def map_columns(df: pd.DataFrame) -> Dict[str, str]:
 # =========================
 # Normalization (no currency gate)
 # =========================
-def normalize_table(df_raw: pd.DataFrame, meta: Dict[str, Any], colmap: Dict[str, str], source_type: str, source_file: str, cfg: ReconConfig) -> pd.DataFrame:
+def normalize_table(
+    df_raw: pd.DataFrame,
+    meta: Dict[str, Any],
+    colmap: Dict[str, str],
+    source_type: str,
+    source_file: str,
+    cfg: ReconConfig,
+) -> pd.DataFrame:
     df = df_raw.copy()
 
     txn_date = safe_col(df, colmap.get("txn_date", ""))
@@ -524,6 +507,7 @@ def normalize_table(df_raw: pd.DataFrame, meta: Dict[str, Any], colmap: Dict[str
     )
     out["blob_text"] = blob.apply(norm_space)
     out["docid"] = out["blob_text"].apply(extract_docid)
+
     out["token_blob"] = out["blob_text"].apply(lambda s: " ".join(extract_tokens(s, min_len=cfg.min_token_len)))
 
     out["source_type"] = source_type
@@ -546,6 +530,7 @@ def normalize_table(df_raw: pd.DataFrame, meta: Dict[str, Any], colmap: Dict[str
 
     keep = out["amount_signed"].notna() | out["invoice_key"].ne("") | out["doc_key"].ne("") | out["docid"].ne("")
     out = out.loc[keep].copy()
+
     out = out.loc[~(out["txn_date"].isna() & out["invoice_key"].eq("") & out["doc_key"].eq("") & out["docid"].eq(""))].copy()
 
     return out.reset_index(drop=True)
@@ -670,7 +655,7 @@ def reconcile_fast(statement_all: pd.DataFrame, ledger_all: pd.DataFrame, cfg: R
 
     used_ledger = set()
 
-    # 1) DOCID TOTALS (group to group)
+    # 1) DOCID TOTALS
     st_doc = st_df.loc[st_df["docid"].fillna("").astype(str).ne("")].copy()
     lg_doc = lg_df.loc[lg_df["docid"].fillna("").astype(str).ne("")].copy()
 
@@ -711,12 +696,16 @@ def reconcile_fast(statement_all: pd.DataFrame, ledger_all: pd.DataFrame, cfg: R
             s_uids = [x for x in to_str(r.get("statement_uids", "")).split(",") if x.strip()]
             l_uids = [x for x in to_str(r.get("ledger_uids", "")).split(",") if x.strip()]
 
-            st_df.loc[st_df["row_uid"].astype(str).isin(s_uids), ["match_status", "match_group_id", "match_rule", "match_score", "match_reason", "counterparty_uids"]] = [
-                "matched", gid, "docid_total", sc, rs, ",".join(l_uids[:80])
-            ]
-            lg_df.loc[lg_df["row_uid"].astype(str).isin(l_uids), ["match_status", "match_group_id", "match_rule", "match_score", "match_reason", "counterparty_uids"]] = [
-                "matched", gid, "docid_total", sc, rs, ",".join(s_uids[:80])
-            ]
+            st_df.loc[
+                st_df["row_uid"].astype(str).isin(s_uids),
+                ["match_status", "match_group_id", "match_rule", "match_score", "match_reason", "counterparty_uids"],
+            ] = ["matched", gid, "docid_total", sc, rs, ",".join(l_uids[:80])]
+
+            lg_df.loc[
+                lg_df["row_uid"].astype(str).isin(l_uids),
+                ["match_status", "match_group_id", "match_rule", "match_score", "match_reason", "counterparty_uids"],
+            ] = ["matched", gid, "docid_total", sc, rs, ",".join(s_uids[:80])]
+
             for lu in l_uids:
                 used_ledger.add(str(lu))
 
@@ -738,7 +727,7 @@ def reconcile_fast(statement_all: pd.DataFrame, ledger_all: pd.DataFrame, cfg: R
                 }
             )
 
-    # 2) INVOICE TOTALS for remaining
+    # 2) INVOICE TOTALS
     st_rem = st_df.loc[~st_df["match_status"].eq("matched")].copy()
     lg_rem = lg_df.loc[~lg_df["match_status"].eq("matched")].copy()
 
@@ -773,11 +762,13 @@ def reconcile_fast(statement_all: pd.DataFrame, ledger_all: pd.DataFrame, cfg: R
             merged["abs_diff"] = merged["diff"].abs()
             merged["date_diff"] = merged.apply(lambda x: date_diff_days(x["statement_date"], x["ledger_date"]), axis=1)
             merged["overlap"] = merged.apply(lambda x: token_overlap(to_str(x["statement_details"]), to_str(x["ledger_details"]), min_len=cfg.min_token_len), axis=1)
+
             merged = merged.sort_values(["abs_diff", "date_diff"], ascending=[True, True])
 
             for _, r in merged.iterrows():
                 s_uids = [x for x in to_str(r.get("statement_uids", "")).split(",") if x.strip()]
                 l_uids = [x for x in to_str(r.get("ledger_uids", "")).split(",") if x.strip()]
+
                 if any(st_df.loc[st_df["row_uid"].astype(str).isin(s_uids), "match_status"].eq("matched")):
                     continue
                 if any(lu in used_ledger for lu in l_uids):
@@ -787,12 +778,17 @@ def reconcile_fast(statement_all: pd.DataFrame, ledger_all: pd.DataFrame, cfg: R
                 status = "Matched" if (float(r["abs_diff"]) <= cfg.amount_tolerance and sc >= cfg.min_auto_confidence) else "Needs review"
 
                 gid = new_gid("I")
-                st_df.loc[st_df["row_uid"].astype(str).isin(s_uids), ["match_status", "match_group_id", "match_rule", "match_score", "match_reason", "counterparty_uids"]] = [
-                    "matched", gid, "invoice_total", sc, rs, ",".join(l_uids[:80])
-                ]
-                lg_df.loc[lg_df["row_uid"].astype(str).isin(l_uids), ["match_status", "match_group_id", "match_rule", "match_score", "match_reason", "counterparty_uids"]] = [
-                    "matched", gid, "invoice_total", sc, rs, ",".join(s_uids[:80])
-                ]
+
+                st_df.loc[
+                    st_df["row_uid"].astype(str).isin(s_uids),
+                    ["match_status", "match_group_id", "match_rule", "match_score", "match_reason", "counterparty_uids"],
+                ] = ["matched", gid, "invoice_total", sc, rs, ",".join(l_uids[:80])]
+
+                lg_df.loc[
+                    lg_df["row_uid"].astype(str).isin(l_uids),
+                    ["match_status", "match_group_id", "match_rule", "match_score", "match_reason", "counterparty_uids"],
+                ] = ["matched", gid, "invoice_total", sc, rs, ",".join(s_uids[:80])]
+
                 for lu in l_uids:
                     used_ledger.add(str(lu))
 
@@ -814,7 +810,7 @@ def reconcile_fast(statement_all: pd.DataFrame, ledger_all: pd.DataFrame, cfg: R
                     }
                 )
 
-    # 3) AMOUNT + DATE WINDOW fallback
+    # 3) AMOUNT + DATE fallback
     st_rem = st_df.loc[~st_df["match_status"].eq("matched")].copy()
     lg_rem = lg_df.loc[~lg_df["match_status"].eq("matched")].copy()
     if not st_rem.empty and not lg_rem.empty:
@@ -897,7 +893,9 @@ def reconcile_fast(statement_all: pd.DataFrame, ledger_all: pd.DataFrame, cfg: R
 
     left_table = pd.DataFrame({
         "Date": unmatched_ledger["txn_date"],
-        "Ref": unmatched_ledger["docid"].replace("", np.nan).combine_first(unmatched_ledger["invoice_no_raw"].replace("", np.nan)).combine_first(unmatched_ledger["doc_no_raw"].replace("", np.nan)),
+        "Ref": unmatched_ledger["docid"].replace("", np.nan)
+            .combine_first(unmatched_ledger["invoice_no_raw"].replace("", np.nan))
+            .combine_first(unmatched_ledger["doc_no_raw"].replace("", np.nan)),
         "Details": unmatched_ledger["description_raw"].fillna("").astype(str),
         "Amount": unmatched_ledger["amount_signed"],
         "Action": "Include on statement",
@@ -905,7 +903,9 @@ def reconcile_fast(statement_all: pd.DataFrame, ledger_all: pd.DataFrame, cfg: R
 
     right_table = pd.DataFrame({
         "Date": unmatched_statement["txn_date"],
-        "Ref": unmatched_statement["docid"].replace("", np.nan).combine_first(unmatched_statement["invoice_no_raw"].replace("", np.nan)).combine_first(unmatched_statement["doc_no_raw"].replace("", np.nan)),
+        "Ref": unmatched_statement["docid"].replace("", np.nan)
+            .combine_first(unmatched_statement["invoice_no_raw"].replace("", np.nan))
+            .combine_first(unmatched_statement["doc_no_raw"].replace("", np.nan)),
         "Details": unmatched_statement["description_raw"].fillna("").astype(str),
         "Amount": unmatched_statement["amount_signed"],
         "Action": "Post in ledger",
@@ -954,14 +954,6 @@ def excel_safe(v):
     return v
 
 
-def find_row_by_label(ws, label, label_col=2):
-    for r in range(1, ws.max_row + 1):
-        v = ws.cell(r, label_col).value
-        if isinstance(v, str) and v.strip() == label:
-            return r
-    return None
-
-
 def export_recon_template_bytes(
     template_bytes: bytes,
     supplier_name: str,
@@ -974,6 +966,7 @@ def export_recon_template_bytes(
     commentary_lines: List[Tuple[str, str]],
 ):
     wb = load_workbook(io.BytesIO(template_bytes))
+
     ws = wb["Recon"] if "Recon" in wb.sheetnames else wb[wb.sheetnames[0]]
 
     try:
@@ -1045,8 +1038,6 @@ def export_recon_template_bytes(
         wb.remove(wb["Commentary"])
     ws_c = wb.create_sheet("Commentary")
     ws_c["A1"].value = "Commentary"
-    ws_c["A1"].font = pycopy(ws_c["A1"].font)
-    ws_c["A1"].font = ws_c["A1"].font.copy(bold=True)
 
     r0 = 3
     for k, v in commentary_lines:
@@ -1122,8 +1113,11 @@ def build_run_context(rr: Dict[str, Any]) -> str:
     }
     us = rr.get("unmatched_statement")
     if isinstance(us, pd.DataFrame) and not us.empty:
-        sample = us.head(10)[["txn_date", "invoice_no_raw", "doc_no_raw", "docid", "amount_signed", "description_raw"]].copy()
-        sample["txn_date"] = sample["txn_date"].astype(str)
+        cols = ["txn_date", "invoice_no_raw", "doc_no_raw", "docid", "amount_signed", "description_raw"]
+        cols = [c for c in cols if c in us.columns]
+        sample = us.head(10)[cols].copy()
+        if "txn_date" in sample.columns:
+            sample["txn_date"] = sample["txn_date"].astype(str)
         ctx["unmatched_statement_sample"] = sample.to_dict(orient="records")
     return json.dumps(ctx, ensure_ascii=False)
 
@@ -1131,13 +1125,9 @@ def build_run_context(rr: Dict[str, Any]) -> str:
 # =========================
 # UI
 # =========================
-st.set_page_config(
-    page_title="Tarisai",
-    layout="wide",
-    initial_sidebar_state="collapsed",
-)
+st.set_page_config(page_title="Tarisai", layout="wide")
 
-# DEPLOYMENT LOCK CSS
+# Hard lock light UI and readable text everywhere (local + Streamlit Cloud)
 st.markdown(
     f"""
 <style>
@@ -1151,12 +1141,12 @@ st.markdown(
 }}
 
 html, body {{
-  background-color: var(--wf-bg) !important;
+  background: var(--wf-bg) !important;
   color: var(--wf-text) !important;
 }}
 
 .stApp {{
-  background-color: var(--wf-bg) !important;
+  background: var(--wf-bg) !important;
   color: var(--wf-text) !important;
 }}
 
@@ -1164,59 +1154,56 @@ html, body {{
   padding-top: 2.4rem !important;
   padding-bottom: 2rem !important;
   max-width: 1250px !important;
+  background: var(--wf-bg) !important;
+}}
+
+section[data-testid="stSidebar"] {{
+  background: var(--wf-bg) !important;
+}}
+section[data-testid="stSidebar"] * {{
+  color: var(--wf-text) !important;
+}}
+
+header[data-testid="stHeader"] {{
+  background: var(--wf-bg) !important;
+}}
+footer {{
+  background: var(--wf-bg) !important;
+}}
+
+#MainMenu, footer {{
+  visibility: hidden;
 }}
 
 h1, h2, h3, h4, h5, h6,
 p, span, label, div {{
-  color: var(--wf-text);
-}}
-
-[data-testid="stMarkdownContainer"] p,
-[data-testid="stMarkdownContainer"] span,
-[data-testid="stMarkdownContainer"] div {{
   color: var(--wf-text) !important;
 }}
 
-[data-testid="stWidgetLabel"] > div {{
+[data-testid="stMarkdownContainer"] * {{
   color: var(--wf-text) !important;
-  font-weight: 700 !important;
 }}
 
-[data-testid="stCaptionContainer"] {{
+[data-testid="stCaptionContainer"] * {{
   color: var(--wf-muted) !important;
 }}
 
-[data-testid="stTextInput"] input,
-[data-testid="stNumberInput"] input {{
-  color: var(--wf-text) !important;
-  background: white !important;
-}}
-
-[data-testid="stFileUploader"] label {{
-  color: var(--wf-text) !important;
-}}
-
-[data-testid="stTabs"] button p {{
-  color: var(--wf-text) !important;
-  font-weight: 800 !important;
+.tarisai-hero,
+.tarisai-card {{
+  background: var(--wf-card) !important;
+  border: 1px solid var(--wf-border) !important;
+  border-radius: 16px !important;
 }}
 
 .tarisai-hero {{
-  background: var(--wf-card) !important;
-  border: 1px solid var(--wf-border) !important;
   border-left: 6px solid var(--wf-red) !important;
-  border-radius: 16px !important;
-  padding: 18px 18px !important;
-  margin-bottom: 14px !important;
 }}
 
 .tarisai-title {{
   font-size: 22px !important;
   font-weight: 800 !important;
   margin: 0 !important;
-  color: var(--wf-text) !important;
 }}
-
 .tarisai-sub {{
   font-size: 14px !important;
   color: var(--wf-muted) !important;
@@ -1224,12 +1211,62 @@ p, span, label, div {{
   margin-bottom: 0 !important;
 }}
 
-.tarisai-card {{
+[data-testid="stTabs"] {{
+  background: var(--wf-bg) !important;
+}}
+[data-testid="stTabs"] * {{
+  color: var(--wf-text) !important;
+}}
+[data-testid="stTabs"] button {{
   background: var(--wf-card) !important;
   border: 1px solid var(--wf-border) !important;
-  border-radius: 16px !important;
-  padding: 14px 14px !important;
-  margin-bottom: 14px !important;
+}}
+[data-testid="stTabs"] button[aria-selected="true"] {{
+  border-bottom: 3px solid var(--wf-red) !important;
+}}
+
+[data-testid="stExpander"] {{
+  background: var(--wf-card) !important;
+  border: 1px solid var(--wf-border) !important;
+  border-radius: 14px !important;
+}}
+[data-testid="stExpander"] * {{
+  color: var(--wf-text) !important;
+}}
+
+[data-testid="stFileUploader"] {{
+  background: var(--wf-card) !important;
+  border: 1px solid var(--wf-border) !important;
+  border-radius: 14px !important;
+  padding: 10px !important;
+}}
+[data-testid="stFileUploader"] * {{
+  color: var(--wf-text) !important;
+}}
+
+[data-testid="stTextInput"],
+[data-testid="stNumberInput"],
+[data-testid="stSelectbox"],
+[data-testid="stMultiselect"],
+[data-testid="stDateInput"] {{
+  background: var(--wf-bg) !important;
+}}
+[data-testid="stTextInput"] input,
+[data-testid="stNumberInput"] input {{
+  background: white !important;
+  color: var(--wf-text) !important;
+  border: 1px solid var(--wf-border) !important;
+}}
+[data-testid="stSelectbox"] div,
+[data-testid="stMultiselect"] div {{
+  background: white !important;
+  color: var(--wf-text) !important;
+  border-color: var(--wf-border) !important;
+}}
+
+[data-testid="stWidgetLabel"] > div {{
+  color: var(--wf-text) !important;
+  font-weight: 700 !important;
 }}
 
 div.stButton > button {{
@@ -1239,18 +1276,43 @@ div.stButton > button {{
   border-radius: 12px !important;
   font-weight: 800 !important;
 }}
-
 div.stButton > button:hover {{
   opacity: 0.92 !important;
 }}
 
-header[data-testid="stHeader"] {{
-  background: transparent !important;
+[data-testid="stDataFrame"] {{
+  background: var(--wf-card) !important;
+  border: 1px solid var(--wf-border) !important;
+  border-radius: 14px !important;
+  padding: 6px !important;
+}}
+[data-testid="stDataFrame"] * {{
+  color: var(--wf-text) !important;
+}}
+[data-testid="stDataFrame"] div[role="grid"] {{
+  background: white !important;
+}}
+[data-testid="stDataFrame"] div[role="columnheader"] {{
+  background: var(--wf-bg) !important;
+  color: var(--wf-text) !important;
+}}
+[data-testid="stDataFrame"] div[role="row"] {{
+  background: white !important;
 }}
 
-#MainMenu, footer {{
-  visibility: hidden;
+[data-testid="stChatMessage"] {{
+  background: var(--wf-bg) !important;
 }}
+[data-testid="stChatMessage"] > div {{
+  background: var(--wf-card) !important;
+  border: 1px solid var(--wf-border) !important;
+  border-radius: 14px !important;
+  padding: 10px !important;
+}}
+[data-testid="stChatMessage"] * {{
+  color: var(--wf-text) !important;
+}}
+
 </style>
 """,
     unsafe_allow_html=True,
@@ -1282,7 +1344,9 @@ if "last_cfg" not in st.session_state:
 
 tabs = st.tabs(["Run", "Review", "Chat", "Download"])
 
+# =========================
 # RUN TAB
+# =========================
 with tabs[0]:
     st.markdown('<div class="tarisai-card">', unsafe_allow_html=True)
     c1, c2 = st.columns([1, 1])
@@ -1304,10 +1368,10 @@ with tabs[0]:
     a, b = st.columns(2)
     with a:
         st.subheader("Supplier workbook")
-        supplier_file = st.file_uploader("Upload supplier Excel", type=["xlsx"], key="supp_up")
+        supplier_file = st.file_uploader("Upload supplier Excel", type=["xlsx", "xls"], key="supp_up")
     with b:
         st.subheader("Ledger workbook")
-        ledger_file = st.file_uploader("Upload ledger Excel", type=["xlsx"], key="ledg_up")
+        ledger_file = st.file_uploader("Upload ledger Excel", type=["xlsx", "xls"], key="ledg_up")
     st.markdown("</div>", unsafe_allow_html=True)
 
     st.markdown('<div class="tarisai-card">', unsafe_allow_html=True)
@@ -1340,7 +1404,10 @@ with tabs[0]:
             run_log = pd.concat([log_s, log_l], ignore_index=True)
 
             if st_raw.empty or lg_raw.empty:
-                st.session_state.recon_result = {"error": "Extraction failed for one of the files. Check your sheets and headers.", "run_log": run_log}
+                st.session_state.recon_result = {
+                    "error": "Extraction failed for one of the files. Check your sheets and headers.",
+                    "run_log": run_log,
+                }
             else:
                 rr = reconcile_fast(st_raw, lg_raw, cfg)
                 rr["error"] = None
@@ -1355,7 +1422,9 @@ with tabs[0]:
         elif rr and rr.get("error"):
             st.error(rr["error"])
 
+# =========================
 # REVIEW TAB
+# =========================
 with tabs[1]:
     st.markdown('<div class="tarisai-card">', unsafe_allow_html=True)
     st.subheader("Review")
@@ -1398,7 +1467,9 @@ with tabs[1]:
 
     st.markdown("</div>", unsafe_allow_html=True)
 
+# =========================
 # CHAT TAB (Ollama)
+# =========================
 with tabs[2]:
     st.markdown('<div class="tarisai-card">', unsafe_allow_html=True)
     st.subheader("Chat (Ollama local)")
@@ -1468,7 +1539,9 @@ with tabs[2]:
 
     st.markdown("</div>", unsafe_allow_html=True)
 
+# =========================
 # DOWNLOAD TAB
+# =========================
 with tabs[3]:
     st.markdown('<div class="tarisai-card">', unsafe_allow_html=True)
     st.subheader("Download")
@@ -1481,7 +1554,7 @@ with tabs[3]:
         template_bytes = st.session_state.template_bytes
         if not template_bytes:
             st.warning("Upload your Recon template in the Run tab to get your exact output structure.")
-            st.caption("You can still export the raw sheets, but your preferred layout needs the template.")
+            st.caption("You can still export raw data by using your template.")
         else:
             cfg = st.session_state.last_cfg
             commentary = [
